@@ -186,7 +186,7 @@ def conv_block(
 
 def build_model(
     activation: str = "relu",
-    fc_dropout: float = 0.5,
+    fc_dropout: float = 0.4,
     use_augmentation: bool = True
 ) -> tf.keras.Model:
     inputs = tf.keras.Input(shape=(IMG_SIZE, IMG_SIZE, 1), name="input_image")
@@ -204,20 +204,24 @@ def build_model(
         )
         x = aug(x)
 
-    x = conv_block(x, 32, activation, block_id=1, dropout_rate=0.25)
+    # feature extractor stronger
+    x = conv_block(x, 32, activation, block_id=1, dropout_rate=0.20)
     x = conv_block(x, 64, activation, block_id=2, dropout_rate=0.25)
     x = conv_block(x, 128, activation, block_id=3, dropout_rate=0.30)
+    x = conv_block(x, 256, activation, block_id=4, dropout_rate=0.35)
 
-    x = tf.keras.layers.Flatten(name="flatten")(x)
-    x = tf.keras.layers.Dense(256, use_bias=False, name="fc1")(x)
+    # replace Flatten with GAP
+    x = tf.keras.layers.GlobalAveragePooling2D(name="gap")(x)
+
+    # lighter classifier
+    x = tf.keras.layers.Dense(128, use_bias=False, name="fc1")(x)
     x = tf.keras.layers.BatchNormalization(name="fc1_bn")(x)
     x = apply_activation(x, activation, "fc1_act")
     x = tf.keras.layers.Dropout(fc_dropout, name="fc1_drop")(x)
 
     outputs = tf.keras.layers.Dense(NUM_CLASSES, activation="softmax", name="classifier")(x)
-    model = tf.keras.Model(inputs=inputs, outputs=outputs, name=f"FER2013_CNN_{activation}")
+    model = tf.keras.Model(inputs=inputs, outputs=outputs, name=f"FER2013_CNN_{activation}_step1")
     return model
-
 
 # =========================================================
 # 3. Training / evaluation
@@ -265,7 +269,7 @@ def train_one_experiment(
         ),
         tf.keras.callbacks.EarlyStopping(
             monitor="val_loss",
-            patience=8,
+            patience=12,
             restore_best_weights=True,
             verbose=1
         ),
@@ -366,7 +370,7 @@ def visualize_feature_maps(
     max_maps: int = 8
 ) -> None:
     if layer_names is None:
-        layer_names = ["block1_conv1", "block2_conv1", "block3_conv1"]
+        layer_names = ["block1_conv1", "block2_conv1", "block3_conv1", "block4_conv1"]
 
     model = tf.keras.models.load_model(model_path)
 
@@ -487,54 +491,44 @@ def main():
 
     experiments = [
         {
-            "name": "exp1_relu_lr1e3_aug",
+            "name": "step1_relu_lr1e3_aug_gap_d04",
             "activation": "relu",
             "lr": 1e-3,
             "batch_size": 64,
-            "epochs": 50,
+            "epochs": 70,
+            "fc_dropout": 0.40,
+            "use_augmentation": True,
+            "use_class_weight": False
+        },
+        {
+            "name": "step1_relu_lr1e3_aug_gap_d05",
+            "activation": "relu",
+            "lr": 1e-3,
+            "batch_size": 64,
+            "epochs": 70,
             "fc_dropout": 0.50,
             "use_augmentation": True,
             "use_class_weight": False
         },
         {
-            "name": "exp2_relu_lr1e3_aug_classw",
-            "activation": "relu",
-            "lr": 1e-3,
-            "batch_size": 64,
-            "epochs": 50,
-            "fc_dropout": 0.50,
-            "use_augmentation": True,
-            "use_class_weight": True
-        },
-        {
-            "name": "exp3_relu_lr3e4_aug_classw",
+            "name": "step1_relu_lr3e4_aug_gap_d04",
             "activation": "relu",
             "lr": 3e-4,
             "batch_size": 64,
-            "epochs": 60,
-            "fc_dropout": 0.50,
+            "epochs": 80,
+            "fc_dropout": 0.40,
             "use_augmentation": True,
-            "use_class_weight": True
+            "use_class_weight": False
         },
         {
-            "name": "exp4_lrelu_lr3e4_aug_classw",
-            "activation": "leaky_relu",
+            "name": "step1_relu_lr3e4_aug_gap_d05",
+            "activation": "relu",
             "lr": 3e-4,
             "batch_size": 64,
-            "epochs": 60,
+            "epochs": 80,
             "fc_dropout": 0.50,
             "use_augmentation": True,
-            "use_class_weight": True
-        },
-        {
-            "name": "exp5_sigmoid_lr3e4_aug_classw",
-            "activation": "sigmoid",
-            "lr": 3e-4,
-            "batch_size": 64,
-            "epochs": 60,
-            "fc_dropout": 0.50,
-            "use_augmentation": True,
-            "use_class_weight": True
+            "use_class_weight": False
         }
     ]
 
@@ -577,7 +571,7 @@ def main():
         image=X_test[sample_index],
         true_label=int(y_test[sample_index]),
         save_path=os.path.join(best_exp_dir, "feature_maps_sample0.png"),
-        layer_names=["block1_conv1", "block2_conv1", "block3_conv1"],
+        layer_names=["block1_conv1", "block2_conv1", "block3_conv1", "block4_conv1"],
         max_maps=8
     )
 
