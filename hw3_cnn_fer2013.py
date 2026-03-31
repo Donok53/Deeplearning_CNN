@@ -253,7 +253,7 @@ def train_one_experiment(
     with open(summary_path, "w", encoding="utf-8") as f:
         model.summary(print_fn=lambda line: f.write(line + "\n"))
 
-    ckpt_path = os.path.join(exp_dir, "best_model.keras")
+    ckpt_path = os.path.join(exp_dir, "best_model.h5")
 
     callbacks = [
         tf.keras.callbacks.ModelCheckpoint(
