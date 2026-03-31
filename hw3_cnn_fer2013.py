@@ -7,6 +7,8 @@
 # - Saves architecture summary / results / confusion matrix
 # - Visualizes step-by-step feature maps
 
+from __future__ import annotations
+
 import os
 import json
 import argparse
