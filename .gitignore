@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+dataset/
+hw3_outputs/
+*.keras
+*.h5
+*.ckpt
+*.npy
+*.npz
