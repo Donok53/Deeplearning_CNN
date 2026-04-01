@@ -7,3 +7,5 @@ hw3_outputs/
 *.ckpt
 *.npy
 *.npz
+.venv310/
+hw3_*

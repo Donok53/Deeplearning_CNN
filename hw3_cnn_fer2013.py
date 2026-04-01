@@ -1,16 +1,25 @@
 # hw3_cnn_fer2013.py
 # FER2013 CNN classification for HW#3
-# - Loads fer2013.csv
-# - Trains several CNN settings
-# - Selects best model by validation accuracy
-# - Evaluates on test set
-# - Saves architecture summary / results / confusion matrix
-# - Visualizes step-by-step feature maps
+# Step 4
+# - Best backbone from step1.5
+# - 64 / 128 / 256 + Flatten
+# - AdamW + CosineDecay
+# - No class weight
+# - No label smoothing
+# - GPU 1 default selection
 
 from __future__ import annotations
 
 import os
+
+# ---------------------------------------------------------
+# GPU 1 only
+# ---------------------------------------------------------
+os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "1")
+
 import json
+import math
 import argparse
 import random
 from typing import Dict, List, Tuple
@@ -21,7 +30,6 @@ import matplotlib.pyplot as plt
 import tensorflow as tf
 
 from sklearn.metrics import classification_report, confusion_matrix
-from sklearn.utils.class_weight import compute_class_weight
 
 
 # =========================================================
@@ -45,7 +53,7 @@ def ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
 
 
-def save_json(data: Dict, path: str) -> None:
+def save_json(data: Dict | List, path: str) -> None:
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=4, ensure_ascii=False)
 
@@ -64,7 +72,6 @@ def load_fer2013(csv_path: str) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.
     labels = df["emotion"].astype(np.int32).to_numpy()
     usage = df["Usage"].astype(str).to_numpy()
 
-    # Kaggle FER2013 split convention
     train_mask = usage == "Training"
     val_mask = np.isin(usage, ["PublicTest", "Public Test"])
     test_mask = np.isin(usage, ["PrivateTest", "Private Test"])
@@ -86,13 +93,7 @@ def load_fer2013(csv_path: str) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.
     return X_train, y_train, X_val, y_val, X_test, y_test
 
 
-def compute_class_weights(y_train: np.ndarray) -> Dict[int, float]:
-    classes = np.unique(y_train)
-    weights = compute_class_weight(class_weight="balanced", classes=classes, y=y_train)
-    return {int(c): float(w) for c, w in zip(classes, weights)}
-
-
-def plot_history(history: tf.keras.callbacks.History, save_path: str) -> None:
+def plot_history(history: tf.keras.callbacks.History, save_dir: str) -> None:
     hist = history.history
     epochs = range(1, len(hist["loss"]) + 1)
 
@@ -105,7 +106,7 @@ def plot_history(history: tf.keras.callbacks.History, save_path: str) -> None:
     plt.legend()
     plt.grid(alpha=0.3)
     plt.tight_layout()
-    plt.savefig(save_path, dpi=200)
+    plt.savefig(os.path.join(save_dir, "history_loss.png"), dpi=200)
     plt.close()
 
     plt.figure(figsize=(10, 5))
@@ -117,8 +118,7 @@ def plot_history(history: tf.keras.callbacks.History, save_path: str) -> None:
     plt.legend()
     plt.grid(alpha=0.3)
     plt.tight_layout()
-    acc_save_path = save_path.replace("_loss.png", "_acc.png")
-    plt.savefig(acc_save_path, dpi=200)
+    plt.savefig(os.path.join(save_dir, "history_acc.png"), dpi=200)
     plt.close()
 
 
@@ -145,6 +145,29 @@ def plot_confusion_matrix(cm: np.ndarray, class_names: List[str], save_path: str
     plt.tight_layout()
     plt.savefig(save_path, dpi=200)
     plt.close()
+
+
+def setup_gpu() -> None:
+    gpus = tf.config.list_physical_devices("GPU")
+    if gpus:
+        for gpu in gpus:
+            tf.config.experimental.set_memory_growth(gpu, True)
+        print("Visible GPUs to TensorFlow:", gpus)
+    else:
+        print("No GPU visible to TensorFlow. Running on CPU.")
+
+
+class LearningRateLogger(tf.keras.callbacks.Callback):
+    def on_epoch_end(self, epoch, logs=None):
+        opt = self.model.optimizer
+        lr = opt.learning_rate
+
+        if isinstance(lr, tf.keras.optimizers.schedules.LearningRateSchedule):
+            current_lr = lr(opt.iterations).numpy()
+        else:
+            current_lr = tf.keras.backend.get_value(lr)
+
+        print(f"Epoch {epoch + 1}: learning_rate = {current_lr:.8f}")
 
 
 # =========================================================
@@ -204,27 +227,51 @@ def build_model(
         )
         x = aug(x)
 
-    # feature extractor stronger
-    x = conv_block(x, 32, activation, block_id=1, dropout_rate=0.20)
-    x = conv_block(x, 64, activation, block_id=2, dropout_rate=0.25)
-    x = conv_block(x, 128, activation, block_id=3, dropout_rate=0.30)
-    x = conv_block(x, 256, activation, block_id=4, dropout_rate=0.35)
+    # Best backbone from step1.5
+    x = conv_block(x, 64, activation, block_id=1, dropout_rate=0.15)
+    x = conv_block(x, 128, activation, block_id=2, dropout_rate=0.20)
+    x = conv_block(x, 256, activation, block_id=3, dropout_rate=0.25)
 
-    # replace Flatten with GAP
-    x = tf.keras.layers.GlobalAveragePooling2D(name="gap")(x)
-
-    # lighter classifier
-    x = tf.keras.layers.Dense(128, use_bias=False, name="fc1")(x)
+    x = tf.keras.layers.Flatten(name="flatten")(x)
+    x = tf.keras.layers.Dense(256, use_bias=False, name="fc1")(x)
     x = tf.keras.layers.BatchNormalization(name="fc1_bn")(x)
     x = apply_activation(x, activation, "fc1_act")
     x = tf.keras.layers.Dropout(fc_dropout, name="fc1_drop")(x)
 
     outputs = tf.keras.layers.Dense(NUM_CLASSES, activation="softmax", name="classifier")(x)
-    model = tf.keras.Model(inputs=inputs, outputs=outputs, name=f"FER2013_CNN_{activation}_step1")
+    model = tf.keras.Model(inputs=inputs, outputs=outputs, name=f"FER2013_CNN_{activation}_step4")
     return model
 
+
 # =========================================================
-# 3. Training / evaluation
+# 3. Optimizer / scheduler
+# =========================================================
+def build_optimizer(
+    initial_lr: float,
+    weight_decay: float,
+    epochs: int,
+    batch_size: int,
+    train_size: int,
+    alpha: float = 0.05
+) -> tf.keras.optimizers.Optimizer:
+    steps_per_epoch = math.ceil(train_size / batch_size)
+    total_steps = steps_per_epoch * epochs
+
+    lr_schedule = tf.keras.optimizers.schedules.CosineDecay(
+        initial_learning_rate=initial_lr,
+        decay_steps=total_steps,
+        alpha=alpha
+    )
+
+    optimizer = tf.keras.optimizers.AdamW(
+        learning_rate=lr_schedule,
+        weight_decay=weight_decay
+    )
+    return optimizer
+
+
+# =========================================================
+# 4. Training / evaluation
 # =========================================================
 def train_one_experiment(
     config: Dict,
@@ -232,8 +279,7 @@ def train_one_experiment(
     y_train: np.ndarray,
     X_val: np.ndarray,
     y_val: np.ndarray,
-    output_dir: str,
-    class_weight: Dict[int, float] | None = None
+    output_dir: str
 ) -> Dict:
     exp_name = config["name"]
     exp_dir = os.path.join(output_dir, exp_name)
@@ -245,7 +291,14 @@ def train_one_experiment(
         use_augmentation=config["use_augmentation"]
     )
 
-    optimizer = tf.keras.optimizers.Adam(learning_rate=config["lr"])
+    optimizer = build_optimizer(
+        initial_lr=config["initial_lr"],
+        weight_decay=config["weight_decay"],
+        epochs=config["epochs"],
+        batch_size=config["batch_size"],
+        train_size=len(X_train),
+        alpha=config.get("cosine_alpha", 0.05)
+    )
 
     model.compile(
         optimizer=optimizer,
@@ -257,11 +310,11 @@ def train_one_experiment(
     with open(summary_path, "w", encoding="utf-8") as f:
         model.summary(print_fn=lambda line: f.write(line + "\n"))
 
-    ckpt_path = os.path.join(exp_dir, "best_model.h5")
+    checkpoint_path = os.path.join(exp_dir, "best_model.keras")
 
     callbacks = [
         tf.keras.callbacks.ModelCheckpoint(
-            ckpt_path,
+            checkpoint_path,
             monitor="val_accuracy",
             mode="max",
             save_best_only=True,
@@ -269,23 +322,17 @@ def train_one_experiment(
         ),
         tf.keras.callbacks.EarlyStopping(
             monitor="val_loss",
-            patience=12,
+            patience=14,
             restore_best_weights=True,
             verbose=1
         ),
-        tf.keras.callbacks.ReduceLROnPlateau(
-            monitor="val_loss",
-            factor=0.5,
-            patience=3,
-            min_lr=1e-6,
-            verbose=1
-        )
+        LearningRateLogger(),
     ]
 
-    print(f"\n==============================")
+    print("\n==============================")
     print(f"Start experiment: {exp_name}")
     print(json.dumps(config, indent=2, ensure_ascii=False))
-    print(f"==============================")
+    print("==============================")
 
     history = model.fit(
         X_train,
@@ -293,12 +340,11 @@ def train_one_experiment(
         validation_data=(X_val, y_val),
         epochs=config["epochs"],
         batch_size=config["batch_size"],
-        class_weight=class_weight if config["use_class_weight"] else None,
         callbacks=callbacks,
         verbose=1
     )
 
-    plot_history(history, os.path.join(exp_dir, "history_loss.png"))
+    plot_history(history, exp_dir)
 
     best_val_acc = float(np.max(history.history["val_accuracy"]))
     best_val_loss = float(np.min(history.history["val_loss"]))
@@ -306,15 +352,16 @@ def train_one_experiment(
     result = {
         "name": exp_name,
         "activation": config["activation"],
-        "lr": config["lr"],
+        "initial_lr": config["initial_lr"],
+        "weight_decay": config["weight_decay"],
+        "cosine_alpha": config.get("cosine_alpha", 0.05),
         "batch_size": config["batch_size"],
         "epochs_run": len(history.history["loss"]),
         "fc_dropout": config["fc_dropout"],
         "use_augmentation": config["use_augmentation"],
-        "use_class_weight": config["use_class_weight"],
         "best_val_accuracy": best_val_acc,
         "best_val_loss": best_val_loss,
-        "checkpoint_path": ckpt_path,
+        "checkpoint_path": checkpoint_path,
         "summary_path": summary_path
     }
 
@@ -328,7 +375,13 @@ def evaluate_best_model(
     y_test: np.ndarray,
     output_dir: str
 ) -> Dict:
-    model = tf.keras.models.load_model(model_path)
+    model = tf.keras.models.load_model(model_path, compile=False)
+
+    model.compile(
+        optimizer="adam",
+        loss="sparse_categorical_crossentropy",
+        metrics=["accuracy"]
+    )
 
     test_loss, test_acc = model.evaluate(X_test, y_test, verbose=0)
 
@@ -336,7 +389,8 @@ def evaluate_best_model(
     preds = np.argmax(probs, axis=1)
 
     report = classification_report(
-        y_test, preds,
+        y_test,
+        preds,
         target_names=CLASS_NAMES,
         digits=4,
         output_dict=True
@@ -359,7 +413,7 @@ def evaluate_best_model(
 
 
 # =========================================================
-# 4. Feature map visualization
+# 5. Feature map visualization
 # =========================================================
 def visualize_feature_maps(
     model_path: str,
@@ -370,9 +424,9 @@ def visualize_feature_maps(
     max_maps: int = 8
 ) -> None:
     if layer_names is None:
-        layer_names = ["block1_conv1", "block2_conv1", "block3_conv1", "block4_conv1"]
+        layer_names = ["block1_conv1", "block2_conv1", "block3_conv1"]
 
-    model = tf.keras.models.load_model(model_path)
+    model = tf.keras.models.load_model(model_path, compile=False)
 
     outputs = [model.get_layer(name).output for name in layer_names]
     activation_model = tf.keras.Model(inputs=model.input, outputs=outputs)
@@ -385,7 +439,6 @@ def visualize_feature_maps(
     total_rows = len(layer_names) + 1
     plt.figure(figsize=(2 * max_maps, 2 * total_rows))
 
-    # original image
     plt.subplot(total_rows, max_maps, 1)
     plt.imshow(image.squeeze(), cmap="gray")
     plt.title(f"Input\nT:{CLASS_NAMES[true_label]}\nP:{CLASS_NAMES[pred_label]}")
@@ -396,7 +449,7 @@ def visualize_feature_maps(
         plt.axis("off")
 
     for row_idx, fmap in enumerate(feature_maps, start=2):
-        fmap = fmap[0]  # (H, W, C)
+        fmap = fmap[0]
         channels = min(max_maps, fmap.shape[-1])
 
         for ch in range(channels):
@@ -414,10 +467,10 @@ def visualize_feature_maps(
     plt.savefig(save_path, dpi=200)
     plt.close()
 
+
 def find_default_csv() -> str:
     base_dir = os.path.dirname(os.path.abspath(__file__))
 
-    # 가장 먼저 확인할 후보들
     candidates = [
         os.path.join(base_dir, "dataset", "fer2013.csv"),
         os.path.join(base_dir, "dataset", "fer2013", "fer2013.csv"),
@@ -436,7 +489,6 @@ def find_default_csv() -> str:
         if os.path.exists(norm_path):
             return norm_path
 
-    # dataset 폴더 아래를 재귀적으로 탐색
     dataset_dir = os.path.join(base_dir, "dataset")
     if os.path.exists(dataset_dir):
         for root, _, files in os.walk(dataset_dir):
@@ -450,11 +502,12 @@ def find_default_csv() -> str:
 
 
 # =========================================================
-# 5. Main
+# 6. Main
 # =========================================================
 def main():
-    parser = argparse.ArgumentParser()
+    setup_gpu()
 
+    parser = argparse.ArgumentParser()
     parser.add_argument(
         "--csv",
         type=str,
@@ -486,49 +539,29 @@ def main():
     ensure_dir(args.output_dir)
 
     X_train, y_train, X_val, y_val, X_test, y_test = load_fer2013(args.csv)
-    class_weight = compute_class_weights(y_train)
-    print("Class weights:", class_weight)
 
     experiments = [
         {
-            "name": "step1_relu_lr1e3_aug_gap_d04",
+            "name": "step4_relu_adamw_cosine_lr1e3_wd1e4_d04",
             "activation": "relu",
-            "lr": 1e-3,
-            "batch_size": 64,
-            "epochs": 70,
-            "fc_dropout": 0.40,
-            "use_augmentation": True,
-            "use_class_weight": False
-        },
-        {
-            "name": "step1_relu_lr1e3_aug_gap_d05",
-            "activation": "relu",
-            "lr": 1e-3,
-            "batch_size": 64,
-            "epochs": 70,
-            "fc_dropout": 0.50,
-            "use_augmentation": True,
-            "use_class_weight": False
-        },
-        {
-            "name": "step1_relu_lr3e4_aug_gap_d04",
-            "activation": "relu",
-            "lr": 3e-4,
+            "initial_lr": 1e-3,
+            "weight_decay": 1e-4,
+            "cosine_alpha": 0.05,
             "batch_size": 64,
             "epochs": 80,
             "fc_dropout": 0.40,
-            "use_augmentation": True,
-            "use_class_weight": False
+            "use_augmentation": True
         },
         {
-            "name": "step1_relu_lr3e4_aug_gap_d05",
+            "name": "step4_relu_adamw_cosine_lr7e4_wd5e5_d04",
             "activation": "relu",
-            "lr": 3e-4,
+            "initial_lr": 7e-4,
+            "weight_decay": 5e-5,
+            "cosine_alpha": 0.03,
             "batch_size": 64,
-            "epochs": 80,
-            "fc_dropout": 0.50,
-            "use_augmentation": True,
-            "use_class_weight": False
+            "epochs": 90,
+            "fc_dropout": 0.40,
+            "use_augmentation": True
         }
     ]
 
@@ -540,8 +573,7 @@ def main():
             y_train=y_train,
             X_val=X_val,
             y_val=y_val,
-            output_dir=args.output_dir,
-            class_weight=class_weight
+            output_dir=args.output_dir
         )
         all_results.append(result)
 
@@ -571,11 +603,11 @@ def main():
         image=X_test[sample_index],
         true_label=int(y_test[sample_index]),
         save_path=os.path.join(best_exp_dir, "feature_maps_sample0.png"),
-        layer_names=["block1_conv1", "block2_conv1", "block3_conv1", "block4_conv1"],
+        layer_names=["block1_conv1", "block2_conv1", "block3_conv1"],
         max_maps=8
     )
 
-    best_model = tf.keras.models.load_model(best_result["checkpoint_path"])
+    best_model = tf.keras.models.load_model(best_result["checkpoint_path"], compile=False)
     probs = best_model.predict(X_test[:20], verbose=0)
     preds = np.argmax(probs, axis=1)
 
@@ -593,6 +625,7 @@ def main():
     save_json(pred_rows, os.path.join(best_exp_dir, "sample_predictions.json"))
 
     print(f"\nAll outputs saved to: {args.output_dir}")
+
 
 if __name__ == "__main__":
     main()
